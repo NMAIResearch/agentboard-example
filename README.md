@@ -133,4 +133,4 @@ made.
 
 ## Licence
 
-Code under the MIT licence, documentation under CC BY 4.0; see `LICENSE.md`. Shared by NM AI Research.
+Code under the MIT licence, documentation under CC BY 4.0; see `LICENSE.md`. Shared by NMAI Research.
