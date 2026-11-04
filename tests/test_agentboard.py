@@ -150,6 +150,58 @@ class AgentBoardTest(unittest.TestCase):
         self.assertEqual(lines[2], "1 torn or malformed lines skipped")
         self.assertEqual([(e["id"], e["text"]) for e in map(json.loads, lines[:2])], [(1, "first"), (2, "second")])
 
+    def test_split_utf8_writes_are_skipped_and_subsequent_posts_succeed(self):
+        original_write = os.write
+        for character in ("é", "雪", "🎬"):
+            encoded = character.encode("utf-8")
+            for width in range(1, len(encoded)):
+                with self.subTest(character=character, width=width):
+                    directory = self.dir / f"{len(encoded)}-{width}"
+                    env = {"AGENTBOARD_DIR": str(directory)}
+                    first = self.board("post", "agent_b", "first café 🎬", name="agent_a", env=env)
+                    self.assertEqual(first.returncode, 0, first.stderr)
+
+                    def short_write(fd, data):
+                        return original_write(fd, data[:data.index(encoded) + width])
+
+                    with mock.patch.dict(os.environ, {**self.env, **env}, clear=True), \
+                            mock.patch.object(agentboard.os, "write", side_effect=short_write):
+                        with self.assertRaisesRegex(OSError, "short write"):
+                            agentboard.append({"type": "msg", "from": "agent_a", "to": "agent_b", "text": character})
+                    prefix = (directory / "board.jsonl").read_bytes()
+                    log = self.board("log", env=env)
+                    self.assertEqual(log.returncode, 0, log.stderr)
+                    self.assertIn("first café 🎬", log.stdout)
+                    self.assertIn("1 torn or malformed lines skipped", log.stdout)
+                    post = self.board("post", "agent_b", "second", name="agent_a", env=env)
+                    self.assertEqual(post.returncode, 0, post.stderr)
+                    self.assertTrue((directory / "board.jsonl").read_bytes().startswith(prefix))
+                    events, skipped = agentboard.load(directory)
+                    self.assertEqual(skipped, 1)
+                    self.assertEqual([(e["id"], e["text"]) for e in events], [(1, "first café 🎬"), (2, "second")])
+                    with mock.patch.dict(os.environ, env):
+                        snapshot = agentboard.state()
+                    self.assertEqual(snapshot["skipped_lines"], 1)
+                    self.assertEqual([e["text"] for e in snapshot["messages"]], ["second", "first café 🎬"])
+
+    def test_invalid_utf8_lines_are_skipped_without_repairing_the_text(self):
+        first = self.board("post", "agent_b", "first café 🎬 �", name="agent_a")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        event = {"id": 999, "ts": "2000-01-01T00:00:00+00:00", "type": "msg",
+                 "from": "agent_a", "to": "agent_b", "text": "bad"}
+        data = (json.dumps(event) + "\n").encode("utf-8")
+        with (self.dir / "board.jsonl").open("ab") as stream:
+            for invalid in (b"\xff", b"\xc3", b"\xc3("):
+                stream.write(data.replace(b"bad", invalid))
+        post = self.board("post", "agent_b", "second", name="agent_a")
+        self.assertEqual(post.returncode, 0, post.stderr)
+        events, skipped = agentboard.load(self.dir)
+        self.assertEqual(skipped, 3)
+        self.assertEqual([(e["id"], e["text"]) for e in events], [(1, "first café 🎬 �"), (2, "second")])
+        log = self.board("log")
+        self.assertEqual(log.returncode, 0, log.stderr)
+        self.assertIn("3 torn or malformed lines skipped", log.stdout)
+
     def test_who_shows_status_harness_and_quiet_agents(self):
         self.board("status", "building", "the", "board", name="agent_a",
                    env={"AGENTBOARD_HARNESS": "claude-code", "CLAUDE_CODE_SESSION_ID": "s1"})
@@ -202,7 +254,7 @@ class AgentBoardTest(unittest.TestCase):
 
     def test_harness_is_found_from_the_launching_process(self):
         h = agentboard.harness
-        self.assertEqual(h(env={}, chain=[["bash"], ["/home/x/.local/bin/hermes", "chat"]]), "hermes")
+        self.assertEqual(h(env={}, chain=[["bash"], ["/opt/x/.local/bin/hermes", "chat"]]), "hermes")
         self.assertEqual(h(env={}, chain=[["/bin/sh", "-c", "x"], ["node", "/brew/bin/cline", "task"]]), "cline")
         self.assertEqual(h(env={}, chain=[["bash"], ["claude"], ["/usr/bin/konsole"]]), "claude-code")
         self.assertEqual(h(env={}, chain=[["/usr/bin/python3", "/opt/kimi-code/bin/kimi"]]), "kimi")
@@ -216,7 +268,7 @@ class AgentBoardTest(unittest.TestCase):
         s = agentboard.session
         self.assertEqual(s(env={"CLAUDE_CODE_SESSION_ID": "session1-569c"}, procs=[]), "session1-569c")
         self.assertEqual(s(env={"AGENTBOARD_SESSION": "x", "CLAUDE_CODE_SESSION_ID": "y"}, procs=[]), "x")
-        chain = [(10, "500", ["bash"]), (20, "400", ["/home/x/.kimi-code/bin/kimi"]), (30, "300", ["konsole"])]
+        chain = [(10, "500", ["bash"]), (20, "400", ["/opt/x/.kimi-code/bin/kimi"]), (30, "300", ["konsole"])]
         self.assertEqual(s(env={}, procs=chain), "pid20-400")
         self.assertEqual(s(env={}, procs=[(10, "500", ["bash"]), (30, "300", ["konsole"])]), "pid10-500")
         tag = agentboard.tag

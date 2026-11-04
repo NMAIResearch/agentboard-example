@@ -78,10 +78,10 @@ def load(directory: Path | None = None) -> tuple[list[dict], int]:
     """Every well-formed event in file order, and the number of lines skipped as torn or malformed."""
     events, skipped = [], 0
     try:
-        with open((directory or board_dir()) / "board.jsonl", encoding="utf-8") as f:
+        with open((directory or board_dir()) / "board.jsonl", "rb") as f:
             for line in f:
                 try:
-                    event = json.loads(line) if line.endswith("\n") else None
+                    event = json.loads(line.decode("utf-8")) if line.endswith(b"\n") else None
                 except ValueError:
                     event = None
                 if (isinstance(event, dict) and isinstance(event.get("id"), int)
