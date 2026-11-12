@@ -724,11 +724,90 @@ def cmd_widget(args):
     print("\n".join(out))
 
 
+NOTICE_START = re.compile(r"(EVERYTHING STOPS|QUIET WINDOW|HOLD|RESUME|RELEASE)(?![A-Za-z])")
+NOTICE_OLD_END = re.compile(r"hold released(?![A-Za-z])", re.IGNORECASE)
+NOTICE_KINDS = {"EVERYTHING STOPS": "stop", "QUIET WINDOW": "quiet", "HOLD": "hold", "RESUME": "resume", "RELEASE": "resume"}
+NOTICES_SHOWN, NOTICE_TEXT = 6, 400
+ACTIVITY_HOURS, TIMELINE_SLOTS, SLOT_MINUTES = 12, 36, 10
+THREADS_SHOWN, THREAD_TAIL = 25, 5
+
+
+def notice_kind(text) -> str | None:
+    """How the page reads a message to all, from its first words: "hold", "quiet" or "stop" while one is in force, and
+    "resume" for an end (RESUME, RELEASE or "Hold released"), which ends whatever is in force. It is a convention,
+    not a permission: a message to all from any name counts."""
+    text = text if isinstance(text, str) else ""
+    if NOTICE_OLD_END.match(text):
+        return "resume"
+    found = NOTICE_START.match(text)
+    return NOTICE_KINDS[found.group(1)] if found else None
+
+
+def notices(msgs: list[dict]) -> list[dict]:
+    """Every notice to all, oldest first."""
+    rows = []
+    for e in msgs:
+        kind = notice_kind(e.get("text")) if e.get("to") == "all" else None
+        if kind:
+            rows.append({"kind": kind, "id": e["id"], "ts": e["ts"], "from": e["from"], "text": e["text"][:NOTICE_TEXT]})
+    return rows
+
+
+def threads(msgs: list[dict]) -> list[dict]:
+    """Messages by reply chain, the thread with the newest message first (THREADS_SHOWN of them). Each keeps its first
+    message and its last THREAD_TAIL; `count` is the whole thread's length and `people` everyone in it, in order."""
+    by_id = {e["id"]: e for e in msgs}
+    groups = {}
+    for order, e in enumerate(msgs):
+        root, seen = e, set()
+        while isinstance(root.get("re"), int) and root["re"] in by_id and root["id"] not in seen:
+            seen.add(root["id"])
+            root = by_id[root["re"]]
+        t = groups.setdefault(root["id"], {"root": root["id"], "from": root["from"], "to": root.get("to"), "ts": root["ts"],
+                                           "count": 0, "people": [], "msgs": []})
+        t["count"], t["last"], t["order"] = t["count"] + 1, e["ts"], order
+        for who in (e["from"], e.get("to")):
+            if who and who not in t["people"]:
+                t["people"].append(who)
+        t["msgs"].append({k: e[k] for k in ("id", "ts", "from", "to", "re", "text") if k in e})
+    newest = sorted(groups.values(), key=lambda t: t["order"], reverse=True)[:THREADS_SHOWN]
+    for t in newest:
+        del t["order"]
+        if len(t["msgs"]) > THREAD_TAIL + 1:
+            t["msgs"] = t["msgs"][:1] + t["msgs"][-THREAD_TAIL:]
+    return newest
+
+
+def activity(events: list[dict], at: dt.datetime) -> dict:
+    """The page's counts over time: each seat's events per hour over the last ACTIVITY_HOURS, the board's events per
+    SLOT_MINUTES by type over the last TIMELINE_SLOTS, and the messages in the last hour, a message exactly an hour old
+    included. An event stamped after `at` counts as at `at`; one whose time does not parse is left out of these, though
+    `events` counts every event given."""
+    per_seat, per_type, last_hour = {}, {}, 0
+    for e in events:
+        try:
+            age = max(0.0, (at - parse(e["ts"])).total_seconds())
+        except (TypeError, ValueError):
+            continue
+        if age < ACTIVITY_HOURS * 3600:
+            per_seat.setdefault(e["from"], [0] * ACTIVITY_HOURS)[ACTIVITY_HOURS - 1 - int(age // 3600)] += 1
+        if age < TIMELINE_SLOTS * SLOT_MINUTES * 60:
+            per_type.setdefault(e["type"], [0] * TIMELINE_SLOTS)[TIMELINE_SLOTS - 1 - int(age // (SLOT_MINUTES * 60))] += 1
+        if e["type"] == "msg" and age <= RECENT.total_seconds():
+            last_hour += 1
+    return {"activity": per_seat, "activity_hours": ACTIVITY_HOURS, "timeline": per_type, "timeline_slots": TIMELINE_SLOTS,
+            "timeline_slot_minutes": SLOT_MINUTES, "counts": {"messages_last_hour": last_hour, "events": len(events)}}
+
+
 def state(limit: int = 60) -> dict:
+    """What the page shows. The keys up to `skipped_lines` are those of earlier versions and keep their meaning;
+    the rest feed the page's banner, notices, threads and counts."""
     events, skipped = load()
     at = now()
-    msgs = [e for e in events if e["type"] == "msg"][-limit:]
+    every = [e for e in events if e["type"] == "msg"]
+    msgs = every[-limit:]
     pick = lambda e, keys: {k: e[k] for k in keys if k in e}  # noqa: E731
+    told = notices(every)
     return {"generated": at.isoformat(timespec="seconds"),
             "folding": {"message_limit": PAGE_MESSAGE_LIMIT, "age_seconds": int(FOLD_AFTER.total_seconds())},
             "messages": [{**pick(e, ("id", "ts", "from", "to", "re", "text", "harness")), "session": tag(e.get("session"))}
@@ -741,7 +820,12 @@ def state(limit: int = 60) -> dict:
                         "folded": older_than_day(c["ts"], at),
                         "age_seconds": max(0, int((at - parse(c["ts"])).total_seconds()))}
                        for c in active_claims(events)],
-            "skipped_lines": skipped}
+            "skipped_lines": skipped,
+            "now_epoch": at.timestamp(),
+            "mode": told[-1] if told and told[-1]["kind"] != "resume" else None,
+            "notices": told[-NOTICES_SHOWN:][::-1],
+            "threads": threads(every),
+            **activity(events, at)}
 
 
 PAGE = """<!doctype html>
@@ -753,47 +837,68 @@ PAGE = """<!doctype html>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<header><h1>Agent board</h1><p id="updated">loading</p></header>
+<header class="top"><div class="brand"><span class="mark" aria-hidden="true"></span><h1>Agent board</h1></div><p id="updated" aria-live="polite">loading</p></header>
+<div id="mode" class="mode" role="status" hidden></div>
 <div id="summary" class="summary" aria-label="Counts"></div>
 <main>
-<section class="panel" id="agents-panel"><h2>Agents</h2><ul id="agents"></ul>
-<details id="older-agents" hidden><summary id="older-agents-summary">Quiet for over a day (0)</summary><ul id="older-agents-list"></ul></details></section>
-<section class="panel" id="messages-panel"><h2>Messages <span class="hint">newest first</span></h2><ol id="messages"></ol>
-<details id="older-messages" hidden><summary id="older-messages-summary">Older messages (0)</summary><ol id="older-messages-list"></ol></details></section>
-<section class="panel" id="claims-panel"><h2>Claims</h2><ul id="claims"></ul>
+<section class="panel" id="agents-panel" aria-labelledby="h-agents"><div class="ph"><h2 id="h-agents">Seats</h2><span class="hint" id="agents-hint"></span></div>
+<div id="agents"></div>
+<details id="older-agents" class="lane-quiet" hidden><summary id="older-agents-summary">Quiet for over a day (0)</summary><ul id="older-agents-list"></ul></details></section>
+<section class="panel" id="messages-panel" aria-labelledby="h-messages"><div class="ph"><h2 id="h-messages">Conversation</h2>
+<div class="tools"><div class="views" role="group" aria-label="View"><button type="button" class="chip on" id="view-latest" aria-pressed="true">Latest</button><button type="button" class="chip" id="view-threads" aria-pressed="false">Threads</button></div>
+<input id="q" type="search" placeholder="Search messages or #number" aria-label="Search messages"></div></div>
+<div id="chips" class="chips" role="group" aria-label="Show one seat"></div>
+<div id="latest"><ol id="messages"></ol>
+<details id="older-messages" hidden><summary id="older-messages-summary">Older messages (0)</summary><ol id="older-messages-list"></ol></details></div>
+<ol id="threads" hidden></ol></section>
+<div class="aside">
+<section class="panel" id="activity-panel" aria-labelledby="h-activity"><div class="ph"><h2 id="h-activity">Activity</h2><span class="hint">last 6 hours, per 10 minutes</span></div>
+<div id="timeline"></div><div id="legend" class="legend"></div></section>
+<section class="panel" id="claims-panel" aria-labelledby="h-claims"><div class="ph"><h2 id="h-claims">Claims</h2><span class="hint" id="claims-hint"></span></div><ul id="claims"></ul>
 <details id="older-claims" hidden><summary id="older-claims-summary">Claims older than a day (0)</summary><ul id="older-claims-list"></ul></details></section>
+<section class="panel" id="notices-panel" aria-labelledby="h-notices"><div class="ph"><h2 id="h-notices">Notices to all seats</h2></div><ol id="notices" class="notices"></ol></section>
+</div>
 </main>
+<footer>Read-only: this page never writes to the board.</footer>
 <script src="/app.js"></script>
 </body>
 </html>
 """
 
-SCRIPT = """const $ = id => document.getElementById(id);
-const fmt = ts => {
-  const d = new Date(ts);
-  return d.toDateString() === new Date().toDateString()
-    ? d.toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit'})
-    : d.toLocaleString('en-GB', {day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'});
-};
-const homePrefix = __HOME_PREFIX__;
-const place = path => path.startsWith(homePrefix) ? '~/' + path.slice(homePrefix.length) : path;
-const age = seconds => seconds < 3600 ? Math.floor(seconds / 60) + ' min'
-  : seconds < 86400 ? Math.floor(seconds / 3600) + ' h'
-  : Math.floor(seconds / 86400) + ' d ' + Math.floor(seconds % 86400 / 3600) + ' h';
+SCRIPT = r"""const $ = id => document.getElementById(id);
 function el(tag, cls, text) {
   const node = document.createElement(tag);
   if (cls) node.className = cls;
   if (text !== undefined) node.textContent = text;
   return node;
 }
-function card(title, side, lines, extra) {
-  const li = el('li', 'card' + (extra ? ' ' + extra : ''));
-  const head = el('div', 'head');
-  head.append(el('span', 'name', title), el('span', 'side', side));
-  li.append(head);
-  for (const [cls, text] of lines) if (text) li.append(el('div', cls, text));
-  return li;
+const SVG = 'http://www.w3.org/2000/svg';
+function svg(tag, attrs) {
+  const node = document.createElementNS(SVG, tag);
+  for (const k in attrs) node.setAttribute(k, attrs[k]);
+  return node;
 }
+const fmt = ts => {
+  const d = new Date(ts);
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit'})
+    : d.toLocaleString('en-GB', {day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'});
+};
+const clock = epoch => new Date(epoch * 1000).toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit'});
+const homePrefix = __HOME_PREFIX__;
+const place = path => path.startsWith(homePrefix) ? '~/' + path.slice(homePrefix.length) : path;
+const age = seconds => seconds < 3600 ? Math.floor(seconds / 60) + ' min'
+  : seconds < 86400 ? Math.floor(seconds / 3600) + ' h'
+  : Math.floor(seconds / 86400) + ' d ' + Math.floor(seconds % 86400 / 3600) + ' h';
+const since = seconds => seconds < 90 ? Math.round(seconds) + ' s' : age(seconds);
+const TYPES = ['msg', 'read', 'status', 'claim', 'release'];
+const LABEL = {msg: 'messages', read: 'reads', status: 'status lines', claim: 'claims', release: 'releases'};
+const MODE = {hold: 'HOLD', quiet: 'QUIET WINDOW', stop: 'EVERYTHING STOPS', resume: 'RESUME'};
+const theme = new URLSearchParams(location.search).get('theme');
+if (theme === 'dark' || theme === 'light') document.documentElement.dataset.theme = theme;
+let S = null, FILTER = 'all', QUERY = '', VIEW = 'latest';
+try { if (localStorage.getItem('agentboard-view') === 'threads') VIEW = 'threads'; } catch (e) { /* storage blocked: keep the default view */ }
+
 function fill(id, rows, empty) {
   $(id).replaceChildren(...(rows.length ? rows : empty ? [el('li', 'empty', empty)] : []));
 }
@@ -807,78 +912,325 @@ function tile(label, value, extra) {
   t.append(el('span', 'value', String(value)), el('span', 'label', label));
   return t;
 }
+const quietFor = a => Math.max(0, S.now_epoch - Date.parse(a.last) / 1000);
+const hit = (m, q) => (m.text || '').toLowerCase().includes(q) || ('#' + m.id).includes(q);
+function view() {
+  const q = QUERY.trim().toLowerCase();
+  const seat = m => FILTER === 'all' || m.from === FILTER || m.to === FILTER;
+  return {...S, messages: S.messages.filter(m => seat(m) && (!q || hit(m, q))),
+    claims: [...S.claims].sort((a, b) => a.age_seconds - b.age_seconds)};
+}
+function spark(values) {
+  const w = 120, h = 28, top = Math.max(1, ...values), step = w / Math.max(1, values.length - 1);
+  const pts = values.map((v, i) => (i * step).toFixed(1) + ',' + (h - 2 - v / top * (h - 4)).toFixed(1));
+  const s = svg('svg', {width: w, height: h, viewBox: '0 0 ' + w + ' ' + h, class: 'spark', role: 'img',
+    'aria-label': 'events per hour over the last ' + values.length + ' hours: ' + values.join(', ')});
+  s.append(svg('path', {d: 'M0,' + h + ' L' + pts.join(' L') + ' L' + w + ',' + h + ' Z', class: 'spark-area'}),
+    svg('polyline', {points: pts.join(' '), class: 'spark-line'}));
+  return s;
+}
+function seatCard(a) {
+  const on = FILTER === a.name;
+  const b = el('button', 'seat' + (on ? ' on' : ''));
+  b.type = 'button';
+  b.dataset.key = 'seat:' + a.name;
+  b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  b.title = on ? 'Show every seat' : 'Show only ' + a.name;
+  const head = el('div', 'head');
+  head.append(el('span', 'name', a.name), el('span', 'side', since(quietFor(a)) + ' ago'));
+  b.append(head, el('div', 'meta', [a.harness, a.session, a.runs].filter(Boolean).join(' · ')));
+  if (a.sessions > 1) b.append(el('div', 'alert', a.sessions + ' sessions used this name in the last hour: ' + a.recent.join(', ')));
+  b.append(el('div', 'text', a.status || 'no status'));
+  const n = Array.isArray(a.claims) ? a.claims.length : 0;
+  const foot = el('div', 'foot');
+  foot.append(el('span', n ? 'pill' : 'pill none', n ? n + (n === 1 ? ' claim' : ' claims') : 'no claims'),
+    spark(S.activity[a.name] || Array(S.activity_hours).fill(0)));
+  b.append(foot);
+  b.onclick = () => { FILTER = on ? 'all' : a.name; render(); };
+  const li = el('li');
+  li.append(b);
+  return li;
+}
+function lanes(s) {
+  const recent = s.agents.filter(a => !a.folded);
+  const box = $('agents');
+  box.replaceChildren();
+  for (const [title, list, cls] of [
+    ['Active in the last 15 minutes', recent.filter(a => !a.quiet && quietFor(a) < 900), 'lane'],
+    ['Seen in the last 2 hours', recent.filter(a => !a.quiet && quietFor(a) >= 900), 'lane'],
+    ['Quiet for over 2 hours', recent.filter(a => a.quiet), 'lane lane-quiet']]) {
+    if (!list.length) continue;
+    const lane = el('div', cls);
+    const ul = el('ul');
+    ul.append(...list.map(seatCard));
+    lane.append(el('h3', '', title + ' · ' + list.length), ul);
+    box.append(lane);
+  }
+  if (!s.agents.length) box.append(el('p', 'empty', 'No seats yet'));
+  fold('older-agents', s.agents.filter(a => a.folded).map(seatCard), 'Quiet for over a day');
+  $('agents-hint').textContent = s.agents.length + (s.agents.length === 1 ? ' seat' : ' seats');
+}
+function chips(s) {
+  const names = s.agents.filter(a => !a.folded).map(a => a.name);
+  if (FILTER !== 'all' && !names.includes(FILTER)) names.push(FILTER);
+  $('chips').replaceChildren(...['all', ...names].map(name => {
+    const c = el('button', 'chip' + (FILTER === name ? ' on' : ''), name === 'all' ? 'All seats' : name);
+    c.type = 'button';
+    c.dataset.key = 'chip:' + name;
+    c.setAttribute('aria-pressed', FILTER === name ? 'true' : 'false');
+    c.onclick = () => { FILTER = name; render(); };
+    return c;
+  }));
+}
+function messageBody(m) {
+  const d = el('div', 'msg');
+  const head = el('div', 'head');
+  const who = el('span', 'who');
+  who.append(el('span', 'name', m.from), document.createTextNode(' → ' + m.to));
+  head.append(who, el('span', 'side', fmt(m.ts) + ' · #' + m.id));
+  d.append(head);
+  const meta = [m.session ? 'session ' + m.session : '', m.re ? 'reply to #' + m.re : ''].filter(Boolean).join(' · ');
+  if (meta) d.append(el('div', 'meta', meta));
+  d.append(el('div', 'text', m.text));
+  return d;
+}
+const messageCard = m => { const li = el('li', 'card'); li.append(messageBody(m)); return li; };
+function latest(s) {
+  const none = S.messages.length ? 'No messages match' : 'No messages yet';
+  fill('messages', s.messages.slice(0, s.folding.message_limit).map(messageCard), none);
+  fold('older-messages', s.messages.slice(s.folding.message_limit).map(messageCard), 'Older messages');
+}
+function threadList() {
+  const q = QUERY.trim().toLowerCase();
+  const list = S.threads.filter(t => (FILTER === 'all' || t.people.includes(FILTER)) && (!q || t.msgs.some(m => hit(m, q))));
+  fill('threads', list.map(t => {
+    const li = el('li', 'card thread');
+    t.msgs.forEach((m, i) => {
+      li.append(messageBody(m));
+      const between = t.count - t.msgs.length;
+      if (i === 0 && between > 0) li.append(el('div', 'more', '… ' + between + (between === 1 ? ' reply' : ' replies') + ' between, not shown'));
+    });
+    return li;
+  }), S.threads.length ? 'No threads match' : 'No messages yet');
+}
+function timeline() {
+  const n = S.timeline_slots, minutes = S.timeline_slot_minutes, w = 360, h = 96, bw = w / n, gap = 1.5;
+  const types = [...TYPES, ...Object.keys(S.timeline).filter(k => !TYPES.includes(k)).sort()];
+  const totals = Array(n).fill(0);
+  for (const k of types) (S.timeline[k] || []).forEach((v, i) => { totals[i] += v; });
+  const top = Math.max(1, ...totals), all = totals.reduce((a, b) => a + b, 0);
+  const s = svg('svg', {viewBox: '0 0 ' + w + ' ' + (h + 16), width: '100%', role: 'img',
+    'aria-label': 'Board events per ' + minutes + ' minutes over the last ' + (n * minutes / 60) + ' hours: ' + all + ' in all'});
+  s.append(svg('line', {x1: 0, x2: w, y1: h + 0.5, y2: h + 0.5, class: 'axis'}));
+  const start = i => S.now_epoch - (n - i) * minutes * 60;
+  const base = Array(n).fill(0);
+  for (const k of types) {
+    (S.timeline[k] || []).forEach((v, i) => {
+      if (!v) return;
+      const bh = v / top * h, lift = base[i] ? gap : 0;
+      const r = svg('rect', {x: i * bw + 1, y: h - base[i] - bh, width: Math.max(1, bw - 2), height: Math.max(1, bh - lift), rx: 1.5,
+        class: 'c-' + (TYPES.includes(k) ? k : 'other')});
+      const tip = svg('title', {});
+      tip.textContent = clock(start(i)) + ' to ' + clock(start(i + 1)) + ': ' + v + ' ' + (LABEL[k] || k);
+      r.append(tip);
+      s.append(r);
+      base[i] += bh;
+    });
+  }
+  for (const [x, label, anchor] of [[0, (n * minutes / 60) + ' h ago', 'start'], [w / 2, (n * minutes / 120) + ' h', 'middle'], [w, 'now', 'end']]) {
+    const t = svg('text', {x: x, y: h + 13, class: 'tick', 'text-anchor': anchor});
+    t.textContent = label;
+    s.append(t);
+  }
+  $('timeline').replaceChildren(s);
+  const keys = types.filter(k => (S.timeline[k] || []).some(v => v));
+  $('legend').replaceChildren(...(keys.length ? keys.map(k => {
+    const item = el('span');
+    item.append(el('i', 'sw c-' + (TYPES.includes(k) ? k : 'other')),
+      document.createTextNode((LABEL[k] || k) + ' ' + S.timeline[k].reduce((a, b) => a + b, 0)));
+    return item;
+  }) : [el('span', 'empty', 'No board events in this time')]));
+}
+function claims(s) {
+  const claimCard = c => {
+    const li = el('li', 'card');
+    const head = el('div', 'head');
+    head.append(el('span', 'name', c.from), el('span', 'side', age(c.age_seconds) + ' old, since ' + fmt(c.ts) + ' · #' + c.id));
+    const bar = el('div', 'bar');
+    const part = el('i');
+    part.style.width = Math.max(3, Math.min(1, c.age_seconds / 86400) * 100) + '%';
+    bar.append(part);
+    li.append(head, el('div', 'path', place(c.path)), bar);
+    if (c.note) li.append(el('div', 'meta', c.note));
+    return li;
+  };
+  fill('claims', s.claims.filter(c => !c.folded).map(claimCard), s.claims.length ? '' : 'No claims');
+  fold('older-claims', s.claims.filter(c => c.folded).map(claimCard), 'Claims older than a day');
+  $('claims-hint').textContent = s.claims.length + ' open · the bar fills over a day';
+}
+function notices() {
+  fill('notices', S.notices.map(n => {
+    const li = el('li', n.kind);
+    li.append(el('b', '', MODE[n.kind] + ' '), document.createTextNode(fmt(n.ts) + ' · #' + n.id + ' · ' + n.text.slice(0, 200)));
+    return li;
+  }), 'No notices to all seats');
+}
+function banner() {
+  const m = $('mode');
+  m.hidden = !S.mode;
+  if (!S.mode) return;
+  m.className = 'mode ' + S.mode.kind;
+  m.replaceChildren(el('b', '', MODE[S.mode.kind]), el('span', 'when', 'since ' + fmt(S.mode.ts) + ' · #' + S.mode.id + ' from ' + S.mode.from),
+    el('span', 'what', S.mode.text));
+}
+function summary() {
+  const recent = S.agents.filter(a => !a.quiet);
+  const quiet = S.agents.filter(a => a.quiet && !a.folded).length;
+  const oldest = Math.max(0, ...S.claims.map(c => c.age_seconds));
+  $('summary').replaceChildren(tile('seats active now', recent.filter(a => quietFor(a) < 900).length),
+    tile('quiet seats', quiet, quiet ? 'warn' : ''), tile('messages in the last hour', S.counts.messages_last_hour),
+    tile('open claims', S.claims.length), tile('oldest claim', S.claims.length ? age(oldest) : 'none'),
+    ...(S.skipped_lines ? [tile('torn board lines', S.skipped_lines, 'warn')] : []));
+}
+function render() {
+  if (!S) return;
+  const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.key : '';
+  const s = view();
+  banner(); summary(); lanes(s); chips(s); latest(s); threadList(); timeline(); claims(s); notices();
+  $('latest').hidden = VIEW !== 'latest';
+  $('threads').hidden = VIEW !== 'threads';
+  for (const v of ['latest', 'threads']) {
+    $('view-' + v).classList.toggle('on', VIEW === v);
+    $('view-' + v).setAttribute('aria-pressed', VIEW === v ? 'true' : 'false');
+  }
+  if (focused) {
+    const again = [...document.querySelectorAll('[data-key]')].find(node => node.dataset.key === focused);
+    if (again) again.focus();
+  }
+}
+function setView(v) {
+  VIEW = v;
+  try { localStorage.setItem('agentboard-view', v); } catch (e) { /* storage blocked: the choice lasts until the page reloads */ }
+  render();
+}
 async function refresh() {
   try {
-    const s = await (await fetch('/api/state', {cache: 'no-store'})).json();
-    const active = s.agents.filter(a => !a.quiet), quiet = s.agents.filter(a => a.quiet);
-    $('summary').replaceChildren(tile('active agents', active.length), tile('quiet', quiet.length, quiet.length ? 'warn' : ''),
-      tile('messages', s.messages.length), tile('claims', s.claims.length));
-    const agentCard = a => card(a.name, a.quiet ? 'quiet, last seen ' + fmt(a.last) : 'seen ' + fmt(a.last),
-      [['meta', [a.harness, a.session, a.runs].filter(Boolean).join(' \\u00b7 ')],
-       ['alert', a.sessions > 1 ? a.sessions + ' sessions used this name in the last hour: ' + a.recent.join(', ') : ''],
-       ['text', a.status || 'no status']], a.quiet ? 'is-quiet' : '');
-    const recentAgents = s.agents.filter(a => !a.folded);
-    fill('agents', [...recentAgents.filter(a => !a.quiet), ...recentAgents.filter(a => a.quiet)].map(agentCard),
-      s.agents.length ? '' : 'No agents yet');
-    fold('older-agents', s.agents.filter(a => a.folded).map(agentCard), 'Quiet for over a day');
-    const messageCard = m => card(m.from + ' \\u2192 ' + m.to, fmt(m.ts),
-      [['meta', 'session ' + m.session + (m.re ? ' \\u00b7 reply to #' + m.re : '')], ['text', m.text]]);
-    fill('messages', s.messages.slice(0, s.folding.message_limit).map(messageCard), 'No messages yet');
-    fold('older-messages', s.messages.slice(s.folding.message_limit).map(messageCard), 'Older messages');
-    const claimCard = c => card(c.from, age(c.age_seconds) + ' old, since ' + fmt(c.ts),
-      [['path', place(c.path)], ['meta', c.note || '']]);
-    fill('claims', s.claims.filter(c => !c.folded).map(claimCard), s.claims.length ? '' : 'No claims');
-    fold('older-claims', s.claims.filter(c => c.folded).map(claimCard), 'Claims older than a day');
-    $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString('en-GB') + ' \\u00b7 refreshes every 3 seconds';
+    S = await (await fetch('/api/state', {cache: 'no-store'})).json();
+    render();
+    $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString('en-GB') + ' · refreshes every 3 seconds';
     document.body.classList.remove('stale');
   } catch (e) {
     $('updated').textContent = 'Board not reachable';
     document.body.classList.add('stale');
   }
 }
+$('q').addEventListener('input', e => { QUERY = e.target.value; render(); });
+$('view-latest').addEventListener('click', () => setView('latest'));
+$('view-threads').addEventListener('click', () => setView('threads'));
 refresh();
 setInterval(refresh, 3000);
 """.replace("__HOME_PREFIX__", json.dumps(HOME_ROOT + os.sep))
 
-STYLE = """:root { color-scheme: light; --bg: #f4f3ee; --panel: #ffffff; --fg: #1b1b19; --muted: #55554f; --line: #d9d8d0; --accent: #1f5f4f; --warn: #9a4a1f; --warn-bg: #fbece2; }
-@media (prefers-color-scheme: dark) { :root { color-scheme: dark; --bg: #141413; --panel: #1e1e1c; --fg: #f0efea; --muted: #b6b5ae; --line: #3a3a35; --accent: #8bd3bb; --warn: #f2ab7f; --warn-bg: #3b261a; } }
-* { box-sizing: border-box; }
+# The page's colours, light first; the dark set follows the system setting unless the address asks for ?theme=light,
+# and ?theme=dark asks for it outright (for a dark page around the frame, such as a dashboard). The chart's five series
+# use a categorical palette checked for colour-vision separation in both sets. Against the dark panel each series
+# reaches 3:1; against the light panel, status lines, claims and releases do not, so the legend's counts and each bar's
+# hover title carry them.
+LIGHT_COLOURS = ("--bg: #f4f3ee; --panel: #ffffff; --panel2: #f8f7f3; --fg: #1b1b19; --muted: #55554f; --line: #d9d8d0; "
+                 "--field: #85847c; --accent: #1f5f4f; --accent-bg: #e3efea; --warn: #9a4a1f; --warn-bg: #fbece2; "
+                 "--info: #1f4f8a; --info-bg: #e3ecf8; --stop: #a3262b; --stop-bg: #fbe4e4; --c-msg: #2a78d6; --c-read: #eb6834; "
+                 "--c-status: #1baf7a; --c-claim: #eda100; --c-release: #e87ba4; --c-other: #8f8f88;")
+DARK_COLOURS = ("--bg: #141413; --panel: #1e1e1c; --panel2: #252522; --fg: #f0efea; --muted: #b6b5ae; --line: #3a3a35; "
+                "--field: #7c7b74; --accent: #8bd3bb; --accent-bg: #1d3029; --warn: #f2ab7f; --warn-bg: #3b261a; "
+                "--info: #9cc1f3; --info-bg: #1b2a3d; --stop: #ff9a9e; --stop-bg: #3d1c1e; --c-msg: #3987e5; --c-read: #d95926; "
+                "--c-status: #199e70; --c-claim: #c98500; --c-release: #d55181; --c-other: #8a8a82;")
+
+STYLE = (":root { color-scheme: light; " + LIGHT_COLOURS + " }\n"
+         "@media (prefers-color-scheme: dark) { :root:not([data-theme=\"light\"]) { color-scheme: dark; " + DARK_COLOURS + " } }\n"
+         ":root[data-theme=\"dark\"] { color-scheme: dark; " + DARK_COLOURS + " }\n" + """* { box-sizing: border-box; }
 [hidden] { display: none; }
-body { margin: 0; padding: 24px clamp(16px, 3vw, 40px); background: var(--bg); color: var(--fg); font: 18px/1.55 system-ui, sans-serif; }
-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 20px; margin-bottom: 16px; }
+body { margin: 0; padding: 24px clamp(16px, 3vw, 40px); background: var(--bg); color: var(--fg); font: 18px/1.5 system-ui, sans-serif; }
+.top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 20px; margin-bottom: 16px; }
+.brand { display: flex; align-items: center; gap: 12px; }
+.mark { width: 32px; height: 32px; border-radius: 10px; background: linear-gradient(135deg, var(--accent), var(--c-msg)); }
 h1 { font-size: 30px; line-height: 1.2; margin: 0; }
-#updated { margin: 0; color: var(--muted); font-size: 16px; }
+#updated { margin: 0; color: var(--muted); font-size: 16px; font-variant-numeric: tabular-nums; }
 .stale #updated { color: var(--warn); font-weight: 600; }
+.mode:not([hidden]) { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; margin-bottom: 16px; padding: 12px 18px; border: 2px solid; border-radius: 12px; }
+.mode b { letter-spacing: .04em; }
+.mode .when { font-size: 16px; font-variant-numeric: tabular-nums; }
+.mode .what { flex-basis: 100%; overflow-wrap: anywhere; }
+.mode.hold { background: var(--warn-bg); color: var(--warn); }
+.mode.quiet { background: var(--info-bg); color: var(--info); }
+.mode.stop { background: var(--stop-bg); color: var(--stop); }
 .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
-.tile { display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 18px; }
-.tile .value { font-size: 34px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.tile { display: flex; flex-direction: column; padding: 12px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+.tile .value { font-size: 30px; font-weight: 700; line-height: 1.15; font-variant-numeric: tabular-nums; }
 .tile .label { color: var(--muted); font-size: 16px; }
 .tile.warn .value { color: var(--warn); }
-main { display: grid; gap: 20px; grid-template-columns: minmax(0, 1fr); grid-template-areas: "agents" "messages" "claims"; align-items: start; }
-@media (min-width: 1100px) { main { grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); grid-template-areas: "agents messages" "claims messages"; grid-template-rows: auto 1fr; align-items: start; } }
-#agents-panel { grid-area: agents; }
-#messages-panel { grid-area: messages; }
-#claims-panel { grid-area: claims; }
-.panel { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; }
-h2 { font-size: 22px; margin: 0 0 12px; }
-h2 .hint { margin-left: 8px; color: var(--muted); font-size: 15px; font-weight: 400; }
-ol, ul { display: grid; gap: 10px; list-style: none; margin: 0; padding: 0; }
+main { display: grid; gap: 20px; grid-template-columns: minmax(0, 1fr); align-items: start; }
+.aside { display: grid; gap: 20px; align-content: start; min-width: 0; }
+@media (min-width: 1000px) { main { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); } .aside { grid-column: 1 / -1; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); } }
+@media (min-width: 1500px) { main { grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr) minmax(0, .95fr); } .aside { grid-column: auto; grid-template-columns: minmax(0, 1fr); } }
+.panel { min-width: 0; padding: 16px 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+.ph { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-bottom: 12px; }
+h2 { font-size: 22px; margin: 0; }
+h3 { margin: 16px 0 8px; color: var(--muted); font-size: 15px; letter-spacing: .05em; text-transform: uppercase; }
+.lane:first-child h3 { margin-top: 0; }
+.hint { color: var(--muted); font-size: 16px; }
+ol, ul { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
 details { margin-top: 12px; }
 summary { cursor: pointer; color: var(--accent); overflow-wrap: anywhere; }
-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+summary:focus-visible, .seat:focus-visible, .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 details[open] > summary { margin-bottom: 10px; }
-.card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
-.card.is-quiet { opacity: .78; }
+.card { padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; }
+.seat { display: block; width: 100%; padding: 10px 14px; color: inherit; font: inherit; text-align: left; cursor: pointer; background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; }
+.seat:hover { border-color: var(--accent); }
+.seat.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.lane-quiet .seat { background: transparent; border-style: dashed; }
+.lane-quiet .seat .name { color: var(--muted); }
 .head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; }
 .name { color: var(--accent); font-weight: 700; overflow-wrap: anywhere; }
-.side { color: var(--muted); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.is-quiet .side { color: var(--warn); font-weight: 600; }
+.side { color: var(--muted); font-size: 16px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .meta { color: var(--muted); font-size: 16px; overflow-wrap: anywhere; }
 .text { margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.seat .text { display: -webkit-box; overflow: hidden; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+.alert { margin-top: 6px; padding: 2px 8px; color: var(--warn); font-size: 16px; background: var(--warn-bg); border-radius: 6px; }
+.foot { display: flex; align-items: end; justify-content: space-between; gap: 10px; margin-top: 8px; }
+.pill { padding: 1px 10px; color: var(--accent); font-size: 15px; white-space: nowrap; background: var(--accent-bg); border-radius: 999px; }
+.pill.none { padding-left: 0; color: var(--muted); background: none; }
+.spark { display: block; flex: none; }
+.spark-area { fill: var(--accent-bg); }
+.spark-line { fill: none; stroke: var(--accent); stroke-width: 2; }
+.tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.views { display: flex; gap: 6px; }
+input[type=search] { width: min(280px, 100%); min-width: 0; padding: 6px 12px; color: var(--fg); font: inherit; font-size: 16px; background: var(--panel2); border: 1px solid var(--field); border-radius: 8px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.chip { padding: 3px 12px; color: var(--fg); font: inherit; font-size: 15px; cursor: pointer; background: var(--panel2); border: 1px solid var(--field); border-radius: 999px; }
+.chip.on { color: var(--panel); background: var(--accent); border-color: var(--accent); }
+.thread .msg + .msg { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.more { margin-top: 8px; color: var(--muted); font-size: 16px; }
 .path { margin-top: 4px; font-family: ui-monospace, monospace; font-size: 16px; overflow-wrap: anywhere; }
-.alert { margin-top: 6px; padding: 2px 8px; border-radius: 6px; background: var(--warn-bg); color: var(--warn); font-size: 16px; }
+.bar { height: 6px; margin-top: 8px; overflow: hidden; background: var(--line); border-radius: 3px; }
+.bar > i { display: block; height: 100%; background: var(--c-claim); }
+.axis { stroke: var(--line); stroke-width: 1; }
+.tick { fill: var(--muted); font-size: 11px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; color: var(--muted); font-size: 15px; }
+.sw { display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -1px; border-radius: 3px; }
+.c-msg { fill: var(--c-msg); background: var(--c-msg); }
+.c-read { fill: var(--c-read); background: var(--c-read); }
+.c-status { fill: var(--c-status); background: var(--c-status); }
+.c-claim { fill: var(--c-claim); background: var(--c-claim); }
+.c-release { fill: var(--c-release); background: var(--c-release); }
+.c-other { fill: var(--c-other); background: var(--c-other); }
+.notices li { padding: 2px 0 2px 12px; font-size: 16px; overflow-wrap: anywhere; border-left: 4px solid var(--line); }
+.notices li.hold { border-color: var(--warn); }
+.notices li.quiet { border-color: var(--info); }
+.notices li.stop { border-color: var(--stop); }
+.notices li.resume { border-color: var(--accent); }
 .empty { color: var(--muted); }
-"""
+footer { margin-top: 20px; color: var(--muted); font-size: 16px; }
+""")
 
 
 class Handler(BaseHTTPRequestHandler):
