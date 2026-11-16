@@ -13,6 +13,10 @@
     agentboard.py release PATH|ID          release your claim; another agent's needs --force --reason, recorded
     agentboard.py done TEXT...             release all your active claims and set your status in one locked write
     agentboard.py check PATH               who holds PATH: exit 0 if free or yours, 1 if another agent holds it
+    agentboard.py ack ID WORD              acknowledge a message with seen, thanks or noted; wakes no one
+    agentboard.py close ID [--note TEXT]   mark a thread closed; a reply after it reopens the thread
+    agentboard.py clear FLAG --reason TEXT clear a model flag (a name in LEADS)
+    agentboard.py switch --hook            record a model switch from Claude Code's PostModelSwitch hook (stdin)
     agentboard.py who | claims | log       agents with their status, active claims, recent events
     agentboard.py widget                   short text for the desktop widget
     agentboard.py serve [--port 7101]      read-only live page on 127.0.0.1
@@ -23,10 +27,13 @@ not authenticated: a post is never a person's approval, and a claim is advisory.
 Every event carries its session: the harness's own session id where the environment gives one, else pid<PID>-<start>
 for the harness's process, so two sessions under one name can be told apart, and the model and effort where the
 harness records them (session record, command line or configured default).
-Standard library only."""
+`post`, `status`, `done`, `claim` and `close` take --check: count the text against its limit and write nothing.
+`inbox` also shows the pinned line from pinned.txt beside the board when it changes or once a day, acknowledgements
+and closed threads for you, and model flags. Standard library only."""
 import argparse
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -56,6 +63,20 @@ SESSION_VARS = ("AGENTBOARD_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID
 SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,80}")
 HARNESSES = {"claude": "claude-code", "codex": "codex", "kimi": "kimi", "agy": "antigravity", "antigravity": "antigravity",
              "gemini": "gemini", "hermes": "hermes", "cline": "cline"}
+# The pinned line, acknowledgements, closed threads and the model flag
+PINNED, PINNED_EVERY = "pinned.txt", dt.timedelta(hours=24)  # shown when it changes, else once a day per seat
+ACK_WORDS = ("seen", "thanks", "noted")
+LEADS = ("lead",)  # the names whose inbox shows every seat's model flags, and who clear them; set your own
+INBOX_EXTRAS = 5  # acknowledgements, closes and flags shown per inbox, then a count
+MODEL_READER = 2  # events whose model came from the record reader below; only these raise flags
+DELIBERATE = ("command", "picker", "sdk", "resume")  # PostModelSwitch sources that raise no flag; `auto` raises one
+SWITCH_SOURCES = DELIBERATE + ("auto",)
+SYSTEM_FALLBACK = re.compile(r"fallback|refusal", re.IGNORECASE)  # Claude Code's system records of a fallback or refusal
+SYSTEM_STOPPED = re.compile(r"safeguards? stopped", re.IGNORECASE)
+FALLBACK_KEYS = ("originalModel", "fallbackModel", "trigger", "scope", "timestamp")
+# A Claude Code seat's session file is read from where its previous board call
+# stopped (`record_at`), so that a fallback or a stop more than the tail before the next call is still seen; at most SPAN_MAX
+SESSION_TAIL, SPAN_MAX = 262144, 64 * 1024 * 1024
 
 
 class Refused(Exception):
@@ -196,6 +217,31 @@ def tail_text(path: Path, size: int = 262144) -> str:
         return f.read().decode("utf-8", "replace")
 
 
+def read_span(path: Path, since: int | None = None) -> tuple[str, int]:
+    """A Claude Code session file from `since`, where this session's previous board call stopped reading, or from its last
+    SESSION_TAIL bytes, whichever starts earlier, but at most its last SPAN_MAX bytes; as text, with the offset just after its
+    last whole line, which the event keeps as `record_at`, so that a line still being written is read whole next time. A
+    `since` past the file's end (a file replaced or cut) is ignored. A span holding no whole line (one line longer than
+    the span) gives its own start."""
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        start = max(0, size - SESSION_TAIL)
+        if isinstance(since, int) and 0 <= since <= size:
+            start = max(min(start, since), size - SPAN_MAX, 0)
+        f.seek(start)
+        data = f.read(size - start)
+    return data.decode("utf-8", "replace"), start + data.rfind(b"\n") + 1
+
+
+def last_record_at(events: list[dict], sid: str | None) -> int | None:
+    """Where this session's previous board call stopped reading its session file, from the board; None before its first."""
+    for e in reversed(events):
+        at = e.get("record_at")
+        if sid and e.get("session") == sid and isinstance(at, int) and not isinstance(at, bool):
+            return at
+    return None
+
+
 def flags(argv: list[str]) -> tuple[str | None, str | None]:
     """Model and effort from a harness's own command line: -m or --model, --effort, --reasoning or
     --reasoning-effort, and Codex's -c model=... and -c model_reasoning_effort=...."""
@@ -218,16 +264,64 @@ def flags(argv: list[str]) -> tuple[str | None, str | None]:
     return model, effort
 
 
-def session_record(harness_name: str, sid: str | None, home: Path, env) -> tuple[str | None, str | None]:
+def claude_records(text: str) -> dict:
+    """What the board reads from a span of a Claude Code session file, record by record and fields only:
+    - `model`: the last main-loop answer's served model, from a record of type `assistant` (or of no type), not a
+      sidechain's, whose `message.model` is a string not starting with `<` (Claude Code's `<synthetic>` notes);
+    - `requested`: that answer's `requestedModel`, only when it differs from the served model;
+    - `fallback`: the last `system` record whose subtype names a fallback or refusal, with its string FALLBACK_KEYS;
+    - `stopped`: the time of the last `system` record whose content says a model's safeguards stopped a response.
+    Lines that do not parse, the torn first line of the tail among them, are skipped, and a line naming neither a model
+    nor a system record is not parsed at all. A tool call's own `model` argument sits inside the message's content, so it
+    is never read as the model. No conversation text is kept."""
+    out = {}
+    for row in text.splitlines():
+        if '"model"' not in row and '"system"' not in row:
+            continue
+        try:
+            rec = json.loads(row)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        kind, message = rec.get("type"), rec.get("message")
+        if kind in ("assistant", None) and not rec.get("isSidechain") and isinstance(message, dict):
+            model = message.get("model")
+            if isinstance(model, str) and model.strip() and not model.startswith("<"):
+                requested = rec.get("requestedModel")
+                out["model"] = model
+                if isinstance(requested, str) and requested.strip() and requested != model:
+                    out["requested"] = requested[:80]
+                else:
+                    out.pop("requested", None)
+        elif kind == "system":
+            subtype, content = rec.get("subtype"), rec.get("content")
+            if isinstance(subtype, str) and SYSTEM_FALLBACK.search(subtype):
+                found = {k: rec[k][:80] for k in FALLBACK_KEYS if isinstance(rec.get(k), str)}
+                if found:
+                    out["fallback"] = found
+            elif isinstance(content, str) and SYSTEM_STOPPED.search(content) and isinstance(rec.get("timestamp"), str):
+                out["stopped"] = rec["timestamp"][:40]
+    return out
+
+
+def session_record(harness_name: str, sid: str | None, home: Path, env, extra=None,
+                   since: int | None = None) -> tuple[str | None, str | None]:
     """Model and effort from the harness's own record of this session: Claude Code's transcript and the effort it
-    passes to commands, or the last turn of a Codex rollout."""
+    passes to commands, or the last turn of a Codex rollout. For Claude Code, `extra` (a dict) also gets the record
+    reader's `requested`, `fallback` and `stopped` where the span read has them, and `record_at`, where it stopped;
+    `since` is where the previous board call stopped (read_span)."""
     effort = env.get("CLAUDE_EFFORT") or None if harness_name == "claude-code" else None
     if not sid or not SAFE_ID.fullmatch(sid):
         return None, effort
     if harness_name == "claude-code":
         for path in (home / ".claude" / "projects").glob(f"*/{sid}.jsonl"):
-            models = re.findall(r'"model"\s*:\s*"([^"<]+)"', tail_text(path))
-            return (models[-1] if models else None), effort
+            text, record_at = read_span(path, since)
+            found = claude_records(text)
+            if extra is not None:
+                extra.update({k: found[k] for k in ("requested", "fallback", "stopped") if k in found})
+                extra["record_at"] = record_at
+            return found.get("model"), effort
     if harness_name == "codex":
         for path in (home / ".codex" / "sessions").glob(f"*/*/*/rollout-*-{sid}.jsonl"):
             for row in reversed(tail_text(path).splitlines()):
@@ -283,11 +377,15 @@ def configured(harness_name: str, home: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
-def runtime(harness_name: str, sid: str | None, env=None, procs=None, home=None) -> dict:
+def runtime(harness_name: str, sid: str | None, env=None, procs=None, home=None, extra=None, since=None) -> dict:
     """The model and effort this agent runs, each from the first source that has it: `declared` (AGENTBOARD_MODEL,
     AGENTBOARD_EFFORT), `session` (the harness's own record of this session), `flags` (the harness's command line),
-    then `config` (the harness's configured default). `model_from` names the model's source. Read, not authenticated."""
+    then `config` (the harness's configured default). `model_from` names the model's source. Read, not authenticated.
+    `extra` (a dict) gets the session record's `requested`, `fallback` and `stopped` only when the model came from
+    the session, so they always describe the model shown, with `record_at`; `since` goes to session_record. The return
+    itself is as before."""
     env = os.environ if env is None else env
+    found = {}
     home = Path.home() if home is None else home
     procs = processes() if procs is None else procs
     argv = []
@@ -297,7 +395,7 @@ def runtime(harness_name: str, sid: str | None, env=None, procs=None, home=None)
             argv = cmd[hit + 1:]
             break
     sources = (("declared", lambda: (env.get("AGENTBOARD_MODEL"), env.get("AGENTBOARD_EFFORT"))),
-               ("session", lambda: session_record(harness_name, sid, home, env)),
+               ("session", lambda: session_record(harness_name, sid, home, env, found, since)),
                ("flags", lambda: flags(argv)),
                ("config", lambda: configured(harness_name, home)))
     out = {}
@@ -309,6 +407,8 @@ def runtime(harness_name: str, sid: str | None, env=None, procs=None, home=None)
             out["effort"] = str(effort)[:40]
         if "model" in out and "effort" in out:
             break
+    if extra is not None and out.get("model_from") == "session":
+        extra.update(found)
     return out
 
 
@@ -331,8 +431,13 @@ def me(args) -> str:
 
 
 def base(args, kind: str) -> dict:
-    name, sid = harness(), session()
-    return {"type": kind, "from": me(args), "harness": name, "session": sid, **runtime(name, sid)}
+    """The fields every event of this command carries. `model_reader` 2 marks the events whose model the record
+    reader gave, the only ones that raise model flags. A Claude Code seat's session file is read from where
+    its previous board call stopped."""
+    who, name, sid, extra = me(args), harness(), session(), {}
+    since = last_record_at(load()[0], sid) if name == "claude-code" else None
+    found = runtime(name, sid, extra=extra, since=since)
+    return {"type": kind, "from": who, "harness": name, "session": sid, **found, **extra, "model_reader": MODEL_READER}
 
 
 def text_of(words, field: str) -> str:
@@ -340,9 +445,24 @@ def text_of(words, field: str) -> str:
     if not text:
         raise Refused(f"the {field} is empty")
     if len(text) > LIMITS[field]:
-        raise Refused(f"the {field} has {len(text)} characters, more than {LIMITS[field]}: "
-                      "put the detail in a file and post its path")
+        over = len(text) - LIMITS[field]
+        raise Refused(f"the {field} has {len(text)} characters, more than {LIMITS[field]} by {over}: cut {over}, "
+                      "or put the detail in a file and post its path")
     return text
+
+
+def checked(words, field: str) -> int:
+    """--check: count the text as its command would, print the count or raise the command's own refusal, and write
+    nothing."""
+    text = text_of(words, field)
+    n, spare = len(text), LIMITS[field] - len(text)
+    print(f"{n} character{'' if n == 1 else 's'}, {spare} to spare of {LIMITS[field]}")
+    return 0
+
+
+def no_note(command: str) -> int:
+    print(f"no note given: {command} has nothing to count")
+    return 0
 
 
 def canonical(path: str) -> str:
@@ -371,6 +491,171 @@ def unread(events: list[dict], name: str) -> list[dict]:
             and e["from"] != name and e["id"] not in seen]
 
 
+def pinned() -> str | None:
+    """The pinned line: the first non-empty line of pinned.txt beside the board, white space folded, cut at the
+    status limit with " (cut)"; None when the file is missing, empty or unreadable. A person edits the file by hand."""
+    try:
+        text = (board_dir() / PINNED).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    first = next((flat(row) for row in text.splitlines() if row.strip()), None)
+    if not first:
+        return None
+    return first if len(first) <= LIMITS["status"] else first[:LIMITS["status"]].rstrip() + " (cut)"
+
+
+def digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def pinned_due(events: list[dict], name: str, said: str, at: dt.datetime) -> bool:
+    """Whether a seat's inbox shows the pinned line: when it differs from the line that seat was last shown (its last `read`
+    with a `note`), and otherwise once PINNED_EVERY has passed since then."""
+    last = next((e for e in reversed(events) if e["type"] == "read" and e["from"] == name
+                 and isinstance(e.get("note"), str)), None)
+    if last is None or last["note"] != digest(said):
+        return True
+    try:
+        return at - parse(last["ts"]) >= PINNED_EVERY
+    except (TypeError, ValueError):
+        return True
+
+
+def root_of(by_id: dict, e: dict) -> dict:
+    """The first message of `e`'s thread: follow `re` while it names a message on the board, stopping at a loop."""
+    root, seen = e, set()
+    while isinstance(root.get("re"), int) and root["re"] in by_id and root["id"] not in seen:
+        seen.add(root["id"])
+        root = by_id[root["re"]]
+    return root
+
+
+def closures(events: list[dict]) -> dict:
+    """Each thread ever closed, by its root's id: `closed` ({by, at, note}) while closed, else None with `reopened_by`,
+    the first message after the last close (a reply reopens a thread without a command)."""
+    msgs = [e for e in events if e["type"] == "msg"]
+    by_id = {e["id"]: e for e in msgs}
+    out = {}
+    for e in events:
+        if e["type"] == "close" and isinstance(e.get("root"), int) and e["root"] in by_id:
+            out[e["root"]] = {"closed": {"by": e["from"], "at": e["ts"], "note": e.get("note")}, "reopened_by": None,
+                              "close": e["id"]}
+        elif e["type"] == "msg" and out:
+            state = out.get(root_of(by_id, e)["id"])
+            if state and state["closed"] and e["id"] > state["close"]:
+                state["closed"], state["reopened_by"] = None, e["id"]
+    for state in out.values():
+        del state["close"]
+    return out
+
+
+def after_start(ts, start: dt.datetime) -> bool:
+    """Whether a session record's time is at or after the board's first record-reader event; a time that does not
+    parse counts as after, so that it is shown rather than hidden."""
+    try:
+        t = parse(ts)
+    except (TypeError, ValueError):
+        return True
+    return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)) >= start
+
+
+def model_flags(events: list[dict]) -> list[dict]:
+    """The model flags, derived in board order and never stored. Per board
+    name and session, from the events the record reader wrote (`model_reader` 2) whose model the seat itself gave
+    (`model_from` declared, session or flags; never config):
+    - a model unlike that session's previous one from the same source raises a `change` flag, "after a safeguard
+      stop" when the answer was served by another model than requested or the event's fallback was a refusal;
+    - a fallback record not seen before raises a `change` flag from its original to its fallback model, unless an
+      open flag of that session already ends at that model, which then takes the record;
+    - a safeguard stop not seen before, with neither, raises the lighter `stopped` flag;
+    - a fallback or stop timestamped before the board's first record-reader event raises nothing;
+    - a `switch` (Claude Code's PostModelSwitch hook) starts the session's comparison afresh; from a source other
+      than a deliberate one it raises a `change` flag at once.
+    A flag's id is the id of the event that raised it; a `clear` from a LEADS name closes it. Every flag, oldest
+    first, each with `cleared` ({by, at, reason}) or None."""
+    first = next((e for e in events if e.get("model_reader") == MODEL_READER or e["type"] == "switch"), None)
+    if first is None:
+        return []
+    try:
+        start = parse(first["ts"])
+        start = start if start.tzinfo else start.replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        start = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    flags, by_id, prev, seen_fallback, seen_stop = [], {}, {}, {}, {}
+
+    def new_flag(e, kind, was, now_model, safeguard, fallback=None, stopped=None):
+        f = {"id": e["id"], "kind": kind, "name": e["from"], "session": e.get("session"), "from": was, "to": now_model,
+             "since": e["ts"], "safeguard": safeguard, "fallback": fallback, "stopped": stopped, "cleared": None}
+        flags.append(f)
+        by_id[f["id"]] = f
+
+    for e in events:
+        key = (e["from"], e.get("session"))
+        if e["type"] == "clear":
+            f = by_id.get(e.get("flag"))
+            if f and not f["cleared"] and e["from"] in LEADS:
+                f["cleared"] = {"by": e["from"], "at": e["ts"], "reason": e.get("reason")}
+            continue
+        if e["type"] == "switch":
+            prev.pop(key, None)
+            if e.get("source") not in DELIBERATE and isinstance(e.get("now"), str):
+                new_flag(e, "change", e.get("was"), e["now"], False)
+            continue
+        model, source = e.get("model"), e.get("model_from")
+        if (e.get("model_reader") != MODEL_READER or source not in ("declared", "session", "flags")
+                or not isinstance(model, str) or not model):
+            continue
+        fallback = e.get("fallback") if isinstance(e.get("fallback"), dict) and e.get("fallback") else None
+        mark = fallback and (fallback.get("timestamp"), fallback.get("originalModel"), fallback.get("fallbackModel"))
+        new_fallback = bool(fallback) and mark not in seen_fallback.setdefault(key, set()) \
+            and after_start(fallback.get("timestamp"), start)
+        if fallback:
+            seen_fallback[key].add(mark)
+        stop = e.get("stopped") if isinstance(e.get("stopped"), str) else None
+        new_stop = bool(stop) and stop not in seen_stop.setdefault(key, set()) and after_start(stop, start)
+        if stop:
+            seen_stop[key].add(stop)
+        refusal = bool(fallback) and fallback.get("trigger") == "refusal" and (new_fallback or fallback.get("fallbackModel") == model)
+        safeguard = bool(e.get("requested")) or refusal
+        last = prev.get(key)
+        if last and last[1] == source and last[0] != model:
+            new_flag(e, "change", last[0], model, safeguard, fallback if refusal or new_fallback else None,
+                     stop if new_stop else None)
+        elif new_fallback:
+            same = next((f for f in reversed(flags) if (f["name"], f["session"]) == key and not f["cleared"]
+                         and f["kind"] == "change" and f["to"] == fallback.get("fallbackModel")), None)
+            if same:
+                same.update({"fallback": fallback, "safeguard": same["safeguard"] or refusal})
+                if new_stop:
+                    same["stopped"] = stop
+            else:
+                new_flag(e, "change", fallback.get("originalModel"), fallback.get("fallbackModel"),
+                         safeguard or fallback.get("trigger") == "refusal", fallback, stop if new_stop else None)
+        elif new_stop:
+            new_flag(e, "stopped", model, model, True, None, stop)
+        prev[key] = (model, source)
+    return flags
+
+
+def open_flags(events: list[dict]) -> list[dict]:
+    return [f for f in model_flags(events) if not f["cleared"]]
+
+
+def stamp(ts) -> str:
+    """when() for a time from a session record, which may not parse."""
+    try:
+        return when(ts)
+    except (TypeError, ValueError):
+        return str(ts)[:19]
+
+
+def flag_words(f: dict) -> str:
+    """A flag as people read it: `model-a to model-b since 18:46, after a safeguard stop`."""
+    if f["kind"] == "stopped":
+        return f"stopped at {stamp(f['stopped'] or f['since'])}, model unchanged"
+    return f"{f['from'] or '?'} to {f['to']} since {when(f['since'])}" + (", after a safeguard stop" if f["safeguard"] else "")
+
+
 def agents(events: list[dict]) -> list[dict]:
     """One row per board name, with the session it last used. `recent` lists the distinct sessions that used the name
     in the last hour, oldest first, and `sessions` counts them, so a role handed to a new session while the old one
@@ -388,7 +673,9 @@ def agents(events: list[dict]) -> list[dict]:
         if e.get("session") and parse(e["ts"]) > hour:
             recent.setdefault(e["from"], {})[e["session"]] = None
     claims = active_claims(events)
+    flagged = {f["name"]: f for f in open_flags(events)}  # each name's newest open model flag
     for row in rows.values():
+        row["flag"] = flagged.get(row["name"])
         row["quiet"] = now() - parse(row["last"]) > QUIET
         row["claims"] = [c["path"] for c in claims if c["from"] == row["name"]]
         row["recent"] = list(recent.get(row["name"], {}))
@@ -434,6 +721,8 @@ def cmd_post(args):
     to = args.to.strip().lower()
     if to != "all" and not NAME_RE.fullmatch(to):
         raise Refused(f"{args.to!r} is not a board name; use an agent's name or all")
+    if args.check:
+        return checked(args.text, "text")
     event = {**base(args, "msg"), "to": to, "text": text_of(args.text, "text")}
     if args.re:
         event["re"] = args.re
@@ -446,24 +735,66 @@ def cmd_post(args):
     print(f"posted #{event['id']} to {to}")
 
 
+def shown_before(events: list[dict], name: str, key: str) -> set:
+    """The ids a seat's earlier inboxes recorded as shown under `key` (`acks`, `closes` or `flags`)."""
+    return {i for e in events if e["type"] == "read" and e["from"] == name and isinstance(e.get(key), list)
+            for i in e[key] if isinstance(i, int)}
+
+
+def inbox_extras(events: list[dict], name: str) -> list[tuple[str, str, list]]:
+    """What an inbox shows after the messages, each once: acknowledgements of this seat's messages, threads
+    it started that another seat closed, and open model flags (a lead's: every seat's; any other seat's: its
+    own). As (key, plural, [(id, line)]), oldest first."""
+    acks = [(e["id"], f"acknowledged: #{e.get('msg')} {e.get('word')} by {e['from']}") for e in events
+            if e["type"] == "ack" and e.get("to") == name and e["from"] != name]
+    closes = [(e["id"], f"closed: thread #{e.get('root')} by {e['from']} {when(e['ts'])}{noted(e)}") for e in events
+              if e["type"] == "close" and e.get("to") == name and e["from"] != name]
+    flagged = [(f["id"], f"flag {f['id']}: {f['name']}'s model {flag_words(f)}" if f["kind"] == "change"
+                else f"flag {f['id']}: a safeguard stopped {f['name']}'s response at {stamp(f['stopped'] or f['since'])}, "
+                     "model unchanged") for f in open_flags(events)
+               if name in LEADS or f["name"] == name]
+    rows = []
+    for key, plural, items in (("acks", "acknowledgements", acks), ("closes", "closed threads", closes),
+                               ("flags", "model flags", flagged)):
+        done = shown_before(events, name, key)
+        rows.append((key, plural, [item for item in items if item[0] not in done]))
+    return rows
+
+
 def cmd_inbox(args):
     name = me(args)
     events = load()[0]
+    said = pinned()
     if args.all:
+        if said:
+            print(f"Pinned: {said}")
         recent = [e for e in events if e["type"] == "msg" and e.get("to") in (name, "all") and e["from"] != name]
         print("\n".join(line(e) for e in recent[-INBOX_MAX:]) if recent else f"no messages for {name}")
         return
+    due = said is not None and pinned_due(events, name, said, now())
+    if due:
+        print(f"Pinned: {said}")
     waiting = unread(events, name)
+    shown = waiting[:INBOX_MAX]
     if not waiting:
         print("no unread messages")
-        return
-    shown = waiting[:INBOX_MAX]
     for e in shown:
         print(line(e))
     if len(waiting) > len(shown):
         print(f"{len(waiting) - len(shown)} more unread: run inbox again")
-    if not args.peek:
-        append({**base(args, "read"), "msgs": [e["id"] for e in shown]})
+    record = {}
+    for key, plural, items in inbox_extras(events, name):
+        for _, text in items[:INBOX_EXTRAS]:
+            print(text)
+        if len(items) > INBOX_EXTRAS:
+            print(f"{len(items) - INBOX_EXTRAS} more {plural}: run inbox again")
+        if items:
+            record[key] = [i for i, _ in items[:INBOX_EXTRAS]]
+    if not args.peek and (shown or record or due):
+        event = {**base(args, "read"), "msgs": [e["id"] for e in shown], **record}
+        if due:
+            event["note"] = digest(said)
+        append(event)
 
 
 def cmd_read(args):
@@ -478,6 +809,16 @@ def cmd_read(args):
     replies = [e for e in events if e["type"] == "msg" and e.get("re") == msg["id"]]
     if replies:
         print("replies: " + ", ".join(f"#{e['id']} from {e['from']}" for e in replies))
+    for e in events:
+        if e["type"] == "ack" and e.get("msg") == msg["id"]:
+            print(f"acknowledged: {e.get('word')} by {e['from']} {when(e['ts'])}")
+    root = root_of({e["id"]: e for e in events if e["type"] == "msg"}, msg)["id"]
+    thread = closures(events).get(root)
+    if thread and thread["closed"]:
+        c = thread["closed"]
+        print(f"thread #{root} closed by {c['by']} {when(c['at'])}{noted(c)}")
+    elif thread:
+        print(f"thread #{root} reopened by #{thread['reopened_by']}")
     if msg in unread(events, name):
         append({**base(args, "read"), "msgs": [msg["id"]]})
 
@@ -567,11 +908,15 @@ def cmd_nudge(args):
 
 
 def cmd_status(args):
+    if args.check:
+        return checked(args.text, "status")
     event, _ = append({**base(args, "status"), "text": text_of(args.text, "status")})
     print(f"status set for {event['from']}")
 
 
 def cmd_done(args):
+    if args.check:
+        return checked(args.text, "status")
     status = {**base(args, "status"), "text": text_of(args.text, "status")}
     directory = board_dir()
     directory.mkdir(parents=True, exist_ok=True)
@@ -608,6 +953,8 @@ def cmd_claim(args):
     path = canonical(args.path)
     if path == HOME_ROOT or HOME_ROOT.startswith(path.rstrip(os.sep) + os.sep):
         raise Refused(f"{path} is too broad to claim: claim the project folder you will write in")
+    if args.check:
+        return checked([args.note], "note") if args.note else no_note("claim")
     event = {**base(args, "claim"), "path": path}
     if args.note:
         event["note"] = text_of([args.note], "note")
@@ -666,6 +1013,110 @@ def cmd_check(args):
     return 0 if name and all(c["from"] == name for c in hits) else 1
 
 
+def cmd_ack(args):
+    word = args.word.strip().lower()
+    if word not in ACK_WORDS:
+        raise Refused(f"{args.word!r} is not an acknowledgement: use {', '.join(ACK_WORDS[:-1])} or {ACK_WORDS[-1]}")
+    event = {**base(args, "ack"), "msg": args.id, "word": word}
+
+    def guard(events, ev):
+        msg = next((e for e in events if e["type"] == "msg" and e["id"] == ev["msg"]), None)
+        if not msg:
+            raise Refused(f"there is no message #{ev['msg']}")
+        if msg["from"] == ev["from"]:
+            raise Refused(f"#{msg['id']} is your own message")
+        if msg.get("to") not in (ev["from"], "all"):
+            raise Refused(f"#{msg['id']} is to {msg.get('to')}, not to you or to all")
+        done = next((e for e in events if e["type"] == "ack" and e.get("msg") == msg["id"] and e["from"] == ev["from"]), None)
+        if done:
+            raise Refused(f"you acknowledged #{msg['id']} as {done.get('word')} at {when(done['ts'])}")
+        ev["to"] = msg["from"]
+
+    event, _ = append(event, guard)
+    print(f"acknowledged #{event['msg']} as {word}; {event['to']} sees it at its next inbox")
+
+
+def cmd_close(args):
+    if args.check:
+        return checked([args.note], "note") if args.note else no_note("close")
+    event = {**base(args, "close"), "msg": args.id}
+    if args.note:
+        event["note"] = text_of([args.note], "note")
+
+    def guard(events, ev):
+        msgs = [e for e in events if e["type"] == "msg"]
+        by_id = {e["id"]: e for e in msgs}
+        msg = by_id.get(ev["msg"])
+        if not msg:
+            raise Refused(f"there is no message #{ev['msg']}")
+        root = root_of(by_id, msg)
+        people = {who for e in msgs if root_of(by_id, e) is root for who in (e["from"], e.get("to")) if who}
+        if ev["from"] not in people and "all" not in people:
+            raise Refused(f"you are not in thread #{root['id']}: only its people close it")
+        thread = closures(events).get(root["id"])
+        if thread and thread["closed"]:
+            c = thread["closed"]
+            raise Refused(f"thread #{root['id']} is already closed, by {c['by']} at {when(c['at'])}, with no reply since")
+        ev.update({"root": root["id"], "to": root["from"]})
+
+    event, _ = append(event, guard)
+    print(f"closed thread #{event['root']}; a reply reopens it")
+
+
+def cmd_clear(args):
+    name = me(args)
+    if name not in LEADS:
+        raise Refused(f"only {' or '.join(LEADS)} clears a model flag")
+    reason = text_of([args.reason], "reason")
+    event = {**base(args, "clear"), "flag": args.flag, "reason": reason}
+
+    def guard(events, ev):
+        f = next((f for f in model_flags(events) if f["id"] == ev["flag"]), None)
+        if f is None:
+            raise Refused(f"there is no model flag {ev['flag']}")
+        if f["cleared"]:
+            raise Refused(f"flag {f['id']} was cleared by {f['cleared']['by']} at {when(f['cleared']['at'])}")
+
+    event, _ = append(event, guard)
+    print(f"cleared flag {event['flag']}")
+
+
+def cmd_switch(args):
+    """Claude Code's PostModelSwitch settings hook: its input on stdin (session_id, from_model, to_model, source),
+    stored for the board name that last used that session. It never fails the hook: a missing or unusable input, or a
+    session no board name has used, writes nothing and exits 0 with a line saying why."""
+    if not args.hook:
+        raise Refused("switch reads Claude Code's PostModelSwitch hook input on stdin: run it as switch --hook")
+    try:
+        data = json.loads(sys.stdin.read(65536) or "null")
+    except (ValueError, UnicodeError):
+        data = None
+    sid = data.get("session_id") if isinstance(data, dict) else None
+    if not isinstance(sid, str) or not SAFE_ID.fullmatch(sid):
+        print("agentboard switch: no usable session_id in the hook input; nothing written")
+        return 0
+    text = lambda k, n: str(data[k])[:n] if isinstance(data.get(k), str) and data[k].strip() else None  # noqa: E731
+    event = {"type": "switch", "session": sid, "was": text("from_model", 80), "now": text("to_model", 80),
+             "source": text("source", 40) or "unknown"}
+    if not any(e.get("session") == sid for e in load()[0]):
+        print(f"agentboard switch: no board name has used session {tag(sid)}; nothing written")
+        return 0
+
+    def guard(events, ev):
+        last = next((e for e in reversed(events) if e.get("session") == sid), None)
+        if last is None:
+            raise LookupError
+        ev.update({"from": last["from"], "harness": last.get("harness", "claude-code")})
+
+    try:
+        event, _ = append(event, guard)
+    except LookupError:
+        print(f"agentboard switch: no board name has used session {tag(sid)}; nothing written")
+        return 0
+    print(f"switch recorded for {event['from']}: {event['was']} to {event['now']} ({event['source']})")
+    return 0
+
+
 def cmd_who(args):
     rows = agents(load()[0])
     if not rows:
@@ -675,7 +1126,8 @@ def cmd_who(args):
         claims = f", claims {len(r['claims'])}" if r["claims"] else ""
         twice = (f", {r['sessions']} sessions in the last hour ({', '.join(tag(s) for s in r['recent'])}): check only "
                  f"one acts as {r['name']}") if r["sessions"] > 1 else ""
-        print(f"{r['name']} ({ident(r)}) seen {ago(r['last'])}{quiet}{claims}{twice}: "
+        flag = f", MODEL {flag_words(r['flag'])} (flag {r['flag']['id']})," if r["flag"] else ""
+        print(f"{r['name']} ({ident(r)}){flag} seen {ago(r['last'])}{quiet}{claims}{twice}: "
               f"{r['status'] or 'no status'}")
 
 
@@ -759,10 +1211,7 @@ def threads(msgs: list[dict]) -> list[dict]:
     by_id = {e["id"]: e for e in msgs}
     groups = {}
     for order, e in enumerate(msgs):
-        root, seen = e, set()
-        while isinstance(root.get("re"), int) and root["re"] in by_id and root["id"] not in seen:
-            seen.add(root["id"])
-            root = by_id[root["re"]]
+        root = root_of(by_id, e)
         t = groups.setdefault(root["id"], {"root": root["id"], "from": root["from"], "to": root.get("to"), "ts": root["ts"],
                                            "count": 0, "people": [], "msgs": []})
         t["count"], t["last"], t["order"] = t["count"] + 1, e["ts"], order
@@ -799,22 +1248,38 @@ def activity(events: list[dict], at: dt.datetime) -> dict:
             "timeline_slot_minutes": SLOT_MINUTES, "counts": {"messages_last_hour": last_hour, "events": len(events)}}
 
 
+def public_flag(f: dict | None) -> dict | None:
+    """A model flag as the page gets it: the session as people read it, and no clearing (the page shows open ones)."""
+    if not f:
+        return None
+    return {**{k: v for k, v in f.items() if k != "cleared"}, "session": tag(f["session"])}
+
+
 def state(limit: int = 60) -> dict:
     """What the page shows. The keys up to `skipped_lines` are those of earlier versions and keep their meaning;
-    the rest feed the page's banner, notices, threads and counts."""
+    the rest feed the page's banner, notices, threads and counts, then the acknowledgements and closed threads on the
+    messages and threads, each seat's open model flag, the open flags newest first, and the pinned line."""
     events, skipped = load()
     at = now()
     every = [e for e in events if e["type"] == "msg"]
     msgs = every[-limit:]
     pick = lambda e, keys: {k: e[k] for k in keys if k in e}  # noqa: E731
     told = notices(every)
+    acks, closed = {}, closures(events)
+    for e in events:
+        if e["type"] == "ack":
+            acks.setdefault(e.get("msg"), []).append({"by": e["from"], "word": e.get("word"), "at": e["ts"]})
+    threads_now = threads(every)
+    for t in threads_now:
+        t.update({"closed": None, "reopened_by": None, **{k: v for k, v in closed.get(t["root"], {}).items()}})
     return {"generated": at.isoformat(timespec="seconds"),
             "folding": {"message_limit": PAGE_MESSAGE_LIMIT, "age_seconds": int(FOLD_AFTER.total_seconds())},
-            "messages": [{**pick(e, ("id", "ts", "from", "to", "re", "text", "harness")), "session": tag(e.get("session"))}
+            "messages": [{**pick(e, ("id", "ts", "from", "to", "re", "text", "harness")), "session": tag(e.get("session")),
+                          "acks": acks.get(e["id"], []), "thread_closed": closed.get(e["id"], {}).get("closed")}
                          for e in reversed(msgs)],
             "agents": [{**pick(r, ("name", "harness", "last", "status", "status_ts", "quiet", "claims", "sessions")),
                         "session": tag(r["session"]), "recent": [tag(s) for s in r["recent"]], "runs": runs(r),
-                        "folded": older_than_day(r["last"], at)}
+                        "folded": older_than_day(r["last"], at), "flag": public_flag(r["flag"])}
                        for r in agents(events)],
             "claims": [{**pick(c, ("id", "ts", "from", "path", "note")),
                         "folded": older_than_day(c["ts"], at),
@@ -824,8 +1289,10 @@ def state(limit: int = 60) -> dict:
             "now_epoch": at.timestamp(),
             "mode": told[-1] if told and told[-1]["kind"] != "resume" else None,
             "notices": told[-NOTICES_SHOWN:][::-1],
-            "threads": threads(every),
-            **activity(events, at)}
+            "threads": threads_now,
+            **activity(events, at),
+            "flags": [public_flag(f) for f in reversed(open_flags(events))],
+            "pinned": pinned()}
 
 
 PAGE = """<!doctype html>
@@ -838,6 +1305,7 @@ PAGE = """<!doctype html>
 </head>
 <body>
 <header class="top"><div class="brand"><span class="mark" aria-hidden="true"></span><h1>Agent board</h1></div><p id="updated" aria-live="polite">loading</p></header>
+<p id="pinned" class="pinned" hidden></p>
 <div id="mode" class="mode" role="status" hidden></div>
 <div id="summary" class="summary" aria-label="Counts"></div>
 <main>
@@ -892,7 +1360,8 @@ const age = seconds => seconds < 3600 ? Math.floor(seconds / 60) + ' min'
   : Math.floor(seconds / 86400) + ' d ' + Math.floor(seconds % 86400 / 3600) + ' h';
 const since = seconds => seconds < 90 ? Math.round(seconds) + ' s' : age(seconds);
 const TYPES = ['msg', 'read', 'status', 'claim', 'release'];
-const LABEL = {msg: 'messages', read: 'reads', status: 'status lines', claim: 'claims', release: 'releases'};
+const LABEL = {msg: 'messages', read: 'reads', status: 'status lines', claim: 'claims', release: 'releases',
+  ack: 'acknowledgements', close: 'thread closes', clear: 'flag clears', switch: 'model switches'};
 const MODE = {hold: 'HOLD', quiet: 'QUIET WINDOW', stop: 'EVERYTHING STOPS', resume: 'RESUME'};
 const theme = new URLSearchParams(location.search).get('theme');
 if (theme === 'dark' || theme === 'light') document.documentElement.dataset.theme = theme;
@@ -940,6 +1409,7 @@ function seatCard(a) {
   head.append(el('span', 'name', a.name), el('span', 'side', since(quietFor(a)) + ' ago'));
   b.append(head, el('div', 'meta', [a.harness, a.session, a.runs].filter(Boolean).join(' · ')));
   if (a.sessions > 1) b.append(el('div', 'alert', a.sessions + ' sessions used this name in the last hour: ' + a.recent.join(', ')));
+  if (a.flag) b.append(el('div', 'alert flag', flagText(a.flag)));
   b.append(el('div', 'text', a.status || 'no status'));
   const n = Array.isArray(a.claims) ? a.claims.length : 0;
   const foot = el('div', 'foot');
@@ -989,7 +1459,9 @@ function messageBody(m) {
   who.append(el('span', 'name', m.from), document.createTextNode(' → ' + m.to));
   head.append(who, el('span', 'side', fmt(m.ts) + ' · #' + m.id));
   d.append(head);
-  const meta = [m.session ? 'session ' + m.session : '', m.re ? 'reply to #' + m.re : ''].filter(Boolean).join(' · ');
+  const acked = (Array.isArray(m.acks) ? m.acks : []).map(a => a.word + ' by ' + a.by);
+  const meta = [m.session ? 'session ' + m.session : '', m.re ? 'reply to #' + m.re : '', ...acked,
+    m.thread_closed ? 'thread closed' : ''].filter(Boolean).join(' · ');
   if (meta) d.append(el('div', 'meta', meta));
   d.append(el('div', 'text', m.text));
   return d;
@@ -1010,6 +1482,10 @@ function threadList() {
       const between = t.count - t.msgs.length;
       if (i === 0 && between > 0) li.append(el('div', 'more', '… ' + between + (between === 1 ? ' reply' : ' replies') + ' between, not shown'));
     });
+    if (t.closed) {
+      const pill = el('div', 'closed-pill', 'closed by ' + t.closed.by + ' ' + fmt(t.closed.at) + (t.closed.note ? ': ' + t.closed.note : ''));
+      li.append(pill);
+    } else if (t.reopened_by) li.append(el('div', 'more', 'reopened by #' + t.reopened_by));
     return li;
   }), S.threads.length ? 'No threads match' : 'No messages yet');
 }
@@ -1083,6 +1559,15 @@ function banner() {
   m.replaceChildren(el('b', '', MODE[S.mode.kind]), el('span', 'when', 'since ' + fmt(S.mode.ts) + ' · #' + S.mode.id + ' from ' + S.mode.from),
     el('span', 'what', S.mode.text));
 }
+function flagText(f) {
+  if (f.kind === 'stopped') return 'Stopped by a safeguard at ' + fmt(f.stopped || f.since) + ', model unchanged · flag ' + f.id;
+  return 'Model changed: ' + (f.from || '?') + ' to ' + f.to + ' since ' + fmt(f.since) + (f.safeguard ? ', after a safeguard stop' : '') + ' · flag ' + f.id;
+}
+function pinnedLine() {
+  const said = $('pinned');
+  said.hidden = !S.pinned;
+  said.textContent = S.pinned ? 'Pinned: ' + S.pinned : '';
+}
 function summary() {
   const recent = S.agents.filter(a => !a.quiet);
   const quiet = S.agents.filter(a => a.quiet && !a.folded).length;
@@ -1090,13 +1575,14 @@ function summary() {
   $('summary').replaceChildren(tile('seats active now', recent.filter(a => quietFor(a) < 900).length),
     tile('quiet seats', quiet, quiet ? 'warn' : ''), tile('messages in the last hour', S.counts.messages_last_hour),
     tile('open claims', S.claims.length), tile('oldest claim', S.claims.length ? age(oldest) : 'none'),
+    ...(S.flags && S.flags.length ? [tile(S.flags.length === 1 ? 'model flag' : 'model flags', S.flags.length, 'warn')] : []),
     ...(S.skipped_lines ? [tile('torn board lines', S.skipped_lines, 'warn')] : []));
 }
 function render() {
   if (!S) return;
   const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.key : '';
   const s = view();
-  banner(); summary(); lanes(s); chips(s); latest(s); threadList(); timeline(); claims(s); notices();
+  banner(); summary(); lanes(s); chips(s); latest(s); threadList(); timeline(); claims(s); notices(); pinnedLine();
   $('latest').hidden = VIEW !== 'latest';
   $('threads').hidden = VIEW !== 'threads';
   for (const v of ['latest', 'threads']) {
@@ -1196,6 +1682,7 @@ details[open] > summary { margin-bottom: 10px; }
 .text { margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .seat .text { display: -webkit-box; overflow: hidden; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
 .alert { margin-top: 6px; padding: 2px 8px; color: var(--warn); font-size: 16px; background: var(--warn-bg); border-radius: 6px; }
+.alert.flag { color: var(--stop); background: var(--stop-bg); }
 .foot { display: flex; align-items: end; justify-content: space-between; gap: 10px; margin-top: 8px; }
 .pill { padding: 1px 10px; color: var(--accent); font-size: 15px; white-space: nowrap; background: var(--accent-bg); border-radius: 999px; }
 .pill.none { padding-left: 0; color: var(--muted); background: none; }
@@ -1230,6 +1717,8 @@ input[type=search] { width: min(280px, 100%); min-width: 0; padding: 6px 12px; c
 .notices li.resume { border-color: var(--accent); }
 .empty { color: var(--muted); }
 footer { margin-top: 20px; color: var(--muted); font-size: 16px; }
+.pinned:not([hidden]) { margin: 0 0 16px; padding: 10px 16px; color: var(--fg); background: var(--accent-bg); border-left: 4px solid var(--accent); border-radius: 8px; overflow-wrap: anywhere; }
+.closed-pill { display: inline-block; margin-top: 10px; padding: 1px 10px; color: var(--accent); font-size: 15px; background: var(--accent-bg); border-radius: 999px; overflow-wrap: anywhere; }
 """)
 
 
@@ -1287,6 +1776,11 @@ def cmd_serve(args):
         server.server_close()
 
 
+def number(text: str) -> int:
+    """A message or flag id, with or without its #."""
+    return int(text.lstrip("#"))
+
+
 def main(argv=None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--as", dest="as_name", default="", help="your board name (or AGENTBOARD_NAME)")
@@ -1302,26 +1796,43 @@ def main(argv=None) -> int:
     p.add_argument("to")
     p.add_argument("text", nargs="+")
     p.add_argument("--re", type=int, help="the message this replies to")
+    p.add_argument("--check", action="store_true", help="count the text against its limit and write nothing")
     p = command("inbox", cmd_inbox, "your unread messages")
     p.add_argument("--peek", action="store_true", help="leave them unread")
     p.add_argument("--all", action="store_true", help="the newest messages for you, read or not, without marking them; "
                    "for a session taking over a role")
-    command("read", cmd_read, "one message in full").add_argument("id", type=lambda s: int(s.lstrip("#")))
+    command("read", cmd_read, "one message in full").add_argument("id", type=number)
     p = command("wait", cmd_wait, "wait without writing or marking read; timeout exits 3")
     p.description = "Wait for unread messages; exit 0 on messages, 3 on timeout with no output. Never writes."
     p.add_argument("--timeout", type=seconds, default=None, help="seconds to wait (default: indefinitely; 0: check once)")
     p.add_argument("--interval", type=interval_seconds, default=1.0, help="seconds between metadata checks (default: 1)")
     command("nudge", cmd_nudge, "print a resume command for NAME's newest unread message; never run it").add_argument("name")
-    command("status", cmd_status, "what you are doing now").add_argument("text", nargs="+")
-    command("done", cmd_done, "release all your claims and set your status").add_argument("text", nargs="+")
+    for name, func, help_text in (("status", cmd_status, "what you are doing now"),
+                                  ("done", cmd_done, "release all your claims and set your status")):
+        p = command(name, func, help_text)
+        p.add_argument("text", nargs="+")
+        p.add_argument("--check", action="store_true", help="count the text against its limit and write nothing")
     p = command("claim", cmd_claim, "claim a folder or file before writing in it")
     p.add_argument("path")
     p.add_argument("--note", help="what you are doing there")
+    p.add_argument("--check", action="store_true", help="count the note against its limit and write nothing")
     p = command("release", cmd_release, "release a claim by path or id")
     p.add_argument("target")
     p.add_argument("--force", action="store_true", help="release another agent's claim (needs --reason)")
     p.add_argument("--reason", default="")
     command("check", cmd_check, "who holds a path").add_argument("path")
+    p = command("ack", cmd_ack, "acknowledge a message with seen, thanks or noted; wakes no one")
+    p.add_argument("id", type=number)
+    p.add_argument("word", help="seen, thanks or noted")
+    p = command("close", cmd_close, "mark a thread closed; a reply after it reopens the thread")
+    p.add_argument("id", type=number, help="any message of the thread")
+    p.add_argument("--note", help="how it ended")
+    p.add_argument("--check", action="store_true", help="count the note against its limit and write nothing")
+    p = command("clear", cmd_clear, "clear a model flag (a name in LEADS)")
+    p.add_argument("flag", type=number)
+    p.add_argument("--reason", required=True, help="why it is cleared, recorded")
+    p = command("switch", cmd_switch, "record a model switch from Claude Code's PostModelSwitch hook (stdin)")
+    p.add_argument("--hook", action="store_true", help="read the hook's input on stdin")
     command("who", cmd_who, "agents with their status")
     command("claims", cmd_claims, "active claims")
     command("log", cmd_log, "recent events").add_argument("-n", type=int, default=20)
